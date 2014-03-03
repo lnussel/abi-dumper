@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 ###########################################################################
-# ABI Dumper 0.99.7
+# ABI Dumper 0.99.8
 # Dump ABI of an ELF object containing DWARF debug info
 #
 # Copyright (C) 2013 ROSA Laboratory
@@ -43,7 +43,7 @@ use Cwd qw(abs_path cwd realpath);
 use Storable qw(dclone);
 use Data::Dumper;
 
-my $TOOL_VERSION = "0.99.7";
+my $TOOL_VERSION = "0.99.8";
 my $ABI_DUMP_VERSION = "3.2";
 my $ORIG_DIR = cwd();
 my $TMP_DIR = tempdir(CLEANUP=>1);
@@ -54,7 +54,7 @@ my $VTABLE_DUMPER_VERSION = "1.0";
 my ($Help, $ShowVersion, $DumpVersion, $OutputDump, $SortDump, $StdOut,
 $TargetVersion, $ExtraInfo, $FullDump, $AllTypes, $AllSymbols, $BinOnly,
 $SkipCxx, $Loud, $AddrToName, $DumpStatic, $Compare, $AltDebugInfo,
-$OptMem);
+$OptMem, $AddDirs);
 
 my $CmdName = get_filename($0);
 
@@ -110,6 +110,7 @@ GetOptions("h|help!" => \$Help,
   "compare!" => \$Compare,
   "alt=s" => \$AltDebugInfo,
   "mem!" =>\$OptMem,
+  "dir!" =>\$AddDirs,
 # internal options
   "addr2name!" => \$AddrToName
 ) or ERR_MESSAGE();
@@ -201,6 +202,9 @@ GENERAL OPTIONS:
       
   -mem
       Try to optimize system memory usage.
+      
+  -dir
+      Show full paths of source files.
 ";
 
 sub HELP_MESSAGE() {
@@ -236,6 +240,7 @@ my %MergedTypes;
 my %LocalType;
 
 my %SourceFile;
+my %SourceDir;
 my %SourceFile_Alt;
 my %DebugLoc;
 my %TName_Tid;
@@ -262,7 +267,8 @@ my %TypeType = (
     "reference_type"=>"Ref",
     "volatile_type"=>"Volatile",
     "typedef"=>"Typedef",
-    "ptr_to_member_type"=>"FieldPtr"
+    "ptr_to_member_type"=>"FieldPtr",
+    "string_type"=>"String"
 );
 
 my %Qual = (
@@ -637,7 +643,6 @@ sub read_Alt_Info($)
     my $ExtraPath = undef;
     
     # lines info
-    
     if($ExtraInfo)
     {
         $ExtraPath = $ExtraInfo."/".$Name;
@@ -654,14 +659,44 @@ sub read_Alt_Info($)
         open(SRC, "$Readelf -N --debug-dump=line \"$Path\" 2>\"$TMP_DIR/error\" |");
     }
     
-    my $Offset = undef;
+    my $DirTable_Def = undef;
+    my %DirTable = ();
     
     while(<SRC>)
     {
-        if(/(\d+)\s+\d+\s+\d+\s+\d+\s+([^ ]+)/)
+        if(defined $AddDirs)
         {
-            my ($Num, $File) = ($1, $2);
+            if(/Directory table/i)
+            {
+                $DirTable_Def = 1;
+                next;
+            }
+            elsif(/File name table/i)
+            {
+                $DirTable_Def = undef;
+                next;
+            }
+            
+            if(defined $DirTable_Def)
+            {
+                if(/\A\s*(.+?)\Z/) {
+                    $DirTable{keys(%DirTable)+1} = $1;
+                }
+            }
+        }
+        
+        if(/(\d+)\s+(\d+)\s+\d+\s+\d+\s+([^ ]+)/)
+        {
+            my ($Num, $Dir, $File) = ($1, $2, $3);
             chomp($File);
+            
+            if(defined $AddDirs)
+            {
+                if(my $DName = $DirTable{$Dir})
+                {
+                    $File = $DName."/".$File;
+                }
+            }
             
             $SourceFile_Alt{0}{$Num} = $File;
         }
@@ -669,7 +704,6 @@ sub read_Alt_Info($)
     close(SRC);
     
     # debug info
-    
     if($ExtraInfo)
     {
         $ExtraPath = $ExtraInfo."/".$Name;
@@ -806,18 +840,49 @@ sub read_DWARF_Info($)
     }
     
     my $Offset = undef;
+    my $DirTable_Def = undef;
+    my %DirTable = ();
     
     while(<SRC>)
     {
-        if(/Table at offset (\w+)/)
+        if(defined $AddDirs)
         {
+            if(/Directory table/i)
+            {
+                $DirTable_Def = 1;
+                %DirTable = ();
+                next;
+            }
+            elsif(/File name table/i)
+            {
+                $DirTable_Def = undef;
+                next;
+            }
+            
+            if(defined $DirTable_Def)
+            {
+                if(/\A\s*(.+?)\Z/) {
+                    $DirTable{keys(%DirTable)+1} = $1;
+                }
+            }
+        }
+        
+        if(/Table at offset (\w+)/i) {
             $Offset = $1;
         }
         elsif(defined $Offset
-        and /(\d+)\s+\d+\s+\d+\s+\d+\s+([^ ]+)/)
+        and /(\d+)\s+(\d+)\s+\d+\s+\d+\s+([^ ]+)/)
         {
-            my ($Num, $File) = ($1, $2);
+            my ($Num, $Dir, $File) = ($1, $2, $3);
             chomp($File);
+            
+            if(defined $AddDirs)
+            {
+                if(my $DName = $DirTable{$Dir})
+                {
+                    $File = $DName."/".$File;
+                }
+            }
             
             $SourceFile{$Offset}{$Num} = $File;
         }
@@ -879,7 +944,11 @@ sub read_DWARF_Info($)
     
     if(my $Err = readFile("$TMP_DIR/error"))
     { # eu-readelf: cannot get next DIE: invalid DWARF
-        if($Err=~/invalid DWARF/i) {
+        if($Err=~/invalid DWARF/i)
+        {
+            if($Loud) {
+                printMsg("ERROR", $Err);
+            }
             exitStatus("Invalid_DWARF", "invalid DWARF info");
         }
     }
@@ -2715,6 +2784,12 @@ sub getTypeInfo($)
         
         $TInfo{"Size"} = $SYS_WORD;
     }
+    elsif($TInfo{"Type"} eq "String")
+    {
+        $TInfo{"Type"} = "Pointer";
+        $TInfo{"Name"} = "char*";
+        $TInfo{"BaseType"} = $TName_Tid{"Intrinsic"}{"char"};
+    }
     
     foreach my $Pos (sort {int($a) <=> int($b)} keys(%{$Inheritance{$ID}}))
     {
@@ -2940,7 +3015,7 @@ sub setSource($$)
                 $R->{"Line"} = $Line;
             }
         }
-        elsif($Name ne "<built-in>")
+        elsif(index($Name, "<built-in>")==-1)
         { # source
             $R->{"Source"} = $Name;
             if(defined $Line) {
@@ -4419,6 +4494,7 @@ sub scenario()
     
     # clean memory
     %SourceFile = ();
+    %SourceDir = ();
     %SourceFile_Alt = ();
     %DebugLoc = ();
     %TName_Tid = ();
